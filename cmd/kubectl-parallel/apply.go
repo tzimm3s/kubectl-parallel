@@ -14,6 +14,51 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// collectManifests reads all provided files, grouping the contained
+// Kubernetes resources by label. Resources from multiple files are
+// merged together so that none are lost.
+func collectManifests(files []string, label string) (resourceGroups, error) {
+	manifests := make(resourceGroups)
+
+	for _, file := range files {
+		var manifest io.Reader
+
+		if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
+			resp, err := http.Get(file)
+			if err != nil {
+				return nil, err
+			}
+			if resp.StatusCode < 200 || resp.StatusCode > 299 {
+				return nil, fmt.Errorf("unable to read URL %s, server reported %d", file, resp.StatusCode)
+			}
+
+			defer resp.Body.Close()
+			manifest = resp.Body
+		} else if file == "-" {
+			manifest = os.Stdin
+		} else {
+			var err error
+			manifest, err = os.Open(file)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		groups, err := groupManifests(manifest, label)
+		if err != nil {
+			return nil, err
+		}
+
+		for key, resources := range groups {
+			for _, resource := range resources {
+				manifests.insert(key, resource)
+			}
+		}
+	}
+
+	return manifests, nil
+}
+
 func NewApplyCommand(params *rootCommandParams) *cobra.Command {
 	var files []string
 
@@ -21,37 +66,9 @@ func NewApplyCommand(params *rootCommandParams) *cobra.Command {
 		Use:   "apply [flags] -f pod.yaml",
 		Short: fmt.Sprint("Apply resources in parallel using label."),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var manifests resourceGroups
-
-			for _, file := range files {
-				var manifest io.Reader
-
-				if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
-					resp, err := http.Get(file)
-					if err != nil {
-						return err
-					}
-					if resp.StatusCode < 200 || resp.StatusCode > 299 {
-						return fmt.Errorf("unable to read URL %s, server reported %d", file, resp.StatusCode)
-					}
-
-					defer resp.Body.Close()
-					manifest = resp.Body
-				} else if file == "-" {
-					manifest = os.Stdin
-				} else {
-					var err error
-					manifest, err = os.Open(file)
-					if err != nil {
-						return err
-					}
-				}
-
-				var err error
-				manifests, err = groupManifests(manifest, params.label)
-				if err != nil {
-					return err
-				}
+			manifests, err := collectManifests(files, params.label)
+			if err != nil {
+				return err
 			}
 
 			g, _ := errgroup.WithContext(context.Background())
